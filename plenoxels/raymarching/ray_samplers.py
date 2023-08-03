@@ -1,173 +1,42 @@
-"""The ray samplers are almost completely copied from NeRF-studio
+# Copyright 2022 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-https://github.com/nerfstudio-project/nerfstudio/blob/628e4fe1a638e7fb3b7ad33d4d91a4b1d63a9b68/nerfstudio/model_components/ray_samplers.py
-
-Copyright 2022 The Nerfstudio Team. All rights reserved.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+"""
+Collection of sampling strategies
 """
 
 from abc import abstractmethod
-from dataclasses import dataclass
-from typing import Optional, Callable, Tuple, List
+from typing import Any, Callable, List, Optional, Protocol, Tuple, Union, Dict, Literal
 
 import torch
-from torch import nn
+from jaxtyping import Float
+# from nerfacc import OccGridEstimator
+from torch import Tensor
+
+from plenoxels.raymarching.ray_samplers_old import (
+    RayBundle, RaySamples,
+    SpacedSampler, PDFSampler, ProposalNetworkSampler, Sampler)
 
 
-@dataclass
-class RaySamples:
-    """xyz coordinate for ray origin."""
-    origins: torch.Tensor  # [bs:..., 3]
-    """Direction of ray."""
-    directions: torch.Tensor  # [bs:..., 3]
-    """Where the frustum starts along a ray."""
-    starts: torch.Tensor  # [bs:..., 1]
-    """Where the frustum ends along a ray."""
-    ends: torch.Tensor  # [bs:..., 1]
-    """"width" of each sample."""
-    deltas: Optional[torch.Tensor] = None  # [bs, ...?, 1]
-    """Start of normalized bin edges along ray [0,1], before warping is applied, ie. linear in disparity sampling."""
-    spacing_starts: Optional[torch.Tensor] = None  # [bs, ...?, num_samples, 1]
-    """End of normalized bin edges along ray [0,1], before warping is applied, ie. linear in disparity sampling."""
-    spacing_ends: Optional[torch.Tensor] = None  # [bs, ...?, num_samples, 1]
-    """Function to convert bins to euclidean distance."""
-    spacing_to_euclidean_fn: Optional[Callable] = None
-
-    def get_positions(self) -> torch.Tensor:
-        """Calulates "center" position of frustum. Not weighted by mass.
-        Returns:
-            xyz positions (..., 3).
-        """
-        return self.origins + self.directions * (self.starts + self.ends) / 2  # world space
-
-    def get_weights2(self, densities: torch.Tensor) -> torch.Tensor:
-        densities = densities.squeeze(2)
-        deltas = self.deltas.squeeze(2)
-        delta_mask = deltas > 0
-        deltas = deltas[delta_mask]
-
-        delta_density = torch.zeros_like(densities)
-        delta_density[delta_mask] = deltas * densities[delta_mask]
-        alphas = 1 - torch.exp(-delta_density)
-
-        transmittance = torch.cat(
-            (
-                torch.ones(alphas.shape[0], 1, device=alphas.device),
-                torch.cumprod(1.0 - alphas, dim=-1)
-            ), dim=-1
-        )
-        weights = alphas * transmittance[:, :-1]
-        return weights[..., None]
-
-    def get_weights(self, densities: torch.Tensor) -> torch.Tensor:
-        """Return weights based on predicted densities
-        Args:
-            densities: Predicted densities for samples along ray (..., num_samples, 1)
-        Returns:
-            Weights for each sample  (..., num_samples, 1)
-        """
-        delta_mask = self.deltas > 0
-        deltas = self.deltas[delta_mask]
-
-        delta_density = torch.zeros_like(densities)
-        delta_density[delta_mask] = deltas * densities[delta_mask]
-        alphas = 1 - torch.exp(-delta_density)
-
-        transmittance = torch.cumsum(delta_density[..., :-1, :], dim=-2)
-        transmittance = torch.cat(
-            [torch.zeros((*transmittance.shape[:1], 1, 1), device=densities.device), transmittance], dim=-2
-        )
-        transmittance = torch.exp(-transmittance)  # [..., "num_samples"]
-        weights = alphas * transmittance  # [..., "num_samples"]
-        return weights
-
-
-@dataclass
-class RayBundle:
-    """A bundle of ray parameters."""
-
-    """Ray origins (XYZ)"""
-    origins: torch.Tensor  # [..., 3]
-    """Unit ray direction vector"""
-    directions: torch.Tensor  # [..., 3]
-    """Distance along ray to start sampling"""
-    nears: Optional[torch.Tensor] = None  # [..., 1]
-    """Rays Distance along ray to stop sampling"""
-    fars: Optional[torch.Tensor] = None  # [..., 1]
-
-    def __len__(self):
-        num_rays = torch.numel(self.origins) // self.origins.shape[-1]
-        return num_rays
-
-    def get_ray_samples(
-        self,
-        bin_starts: torch.Tensor,
-        bin_ends: torch.Tensor,
-        spacing_starts: Optional[torch.Tensor] = None,
-        spacing_ends: Optional[torch.Tensor] = None,
-        spacing_to_euclidean_fn: Optional[Callable] = None,
-    ) -> RaySamples:
-        """Produces samples for each ray by projection points along the ray direction. Currently samples uniformly.
-        Args:
-            bin_starts: Distance from origin to start of bin.
-                TensorType["bs":..., "num_samples", 1]
-            bin_ends: Distance from origin to end of bin.
-        Returns:
-            Samples projected along ray.
-        """
-        deltas = bin_ends - bin_starts
-        return RaySamples(
-            origins=self.origins[..., None, :],  # [..., 1, 3]
-            directions=self.directions[..., None, :],  # [..., 1, 3]
-            starts=bin_starts,  # [..., num_samples, 1]  world
-            ends=bin_ends,  # [..., num_samples, 1]      world
-            deltas=deltas,  # [..., num_samples, 1]  world coo
-            spacing_starts=spacing_starts,  # [..., num_samples, 1]
-            spacing_ends=spacing_ends,  # [..., num_samples, 1]
-            spacing_to_euclidean_fn=spacing_to_euclidean_fn,
-        )
-
-
-class Sampler(nn.Module):
-    """Generate Samples
-    Args:
-        num_samples: number of samples to take
-    """
-
-    def __init__(
-        self,
-        num_samples: Optional[int] = None,
-    ) -> None:
-        super().__init__()
-        self.num_samples = num_samples
-
-    @abstractmethod
-    def generate_ray_samples(self) -> RaySamples:
-        """Generate Ray Samples"""
-
-    def forward(self, *args, **kwargs) -> RaySamples:
-        """Generate ray samples"""
-        return self.generate_ray_samples(*args, **kwargs)
-
-
-class SpacedSampler(Sampler):
+class LinearSpacedSampler(SpacedSampler):
     """Sample points according to a function.
+
     Args:
         num_samples: Number of samples per ray
         spacing_fn: Function that dictates sample spacing (ie `lambda x : x` is uniform).
         spacing_fn_inv: The inverse of spacing_fn.
-        train_stratified: Use stratified sampling during training. Defults to True
+        train_stratified: Use stratified sampling during training. Defaults to True
         single_jitter: Use a same random jitter for all samples along a ray. Defaults to False
     """
 
@@ -179,64 +48,31 @@ class SpacedSampler(Sampler):
         train_stratified=True,
         single_jitter=False,
     ) -> None:
-        super().__init__(num_samples=num_samples)
-        self.train_stratified = train_stratified
-        self.single_jitter = single_jitter
-        self.spacing_fn = spacing_fn
-        self.spacing_fn_inv = spacing_fn_inv
+        super().__init__(num_samples=num_samples, spacing_fn=spacing_fn, spacing_fn_inv=spacing_fn_inv, train_stratified=train_stratified, single_jitter=single_jitter)
 
-    # noinspection PyMethodOverriding
     def generate_ray_samples(
         self,
-        ray_bundle: RayBundle,
+        ray_bundle: Optional[RayBundle] = None,
         num_samples: Optional[int] = None,
     ) -> RaySamples:
-        """Generates position samples accoring to spacing function.
+        """Generates position samples according to spacing function.
+
         Args:
-            ray_bundle: Ray-origins, directions, etc.
+            ray_bundle: Rays to generate samples for
             num_samples: Number of samples per ray
+
         Returns:
             Positions and deltas for samples along a ray
         """
-        num_samples = num_samples or self.num_samples
-        assert num_samples is not None
-        num_rays = ray_bundle.origins.shape[0]
-
-        bins = torch.linspace(0.0, 1.0, num_samples + 1).to(ray_bundle.origins.device)[None, ...]  # [1, num_samples+1]
-
-        # TODO More complicated than it needs to be.
-        if self.train_stratified and self.training:
-            if self.single_jitter:
-                t_rand = torch.rand((num_rays, 1), dtype=bins.dtype, device=bins.device)
-            else:
-                t_rand = torch.rand((num_rays, num_samples + 1), dtype=bins.dtype, device=bins.device)
-            bin_centers = (bins[..., 1:] + bins[..., :-1]) / 2.0
-            bin_upper = torch.cat([bin_centers, bins[..., -1:]], -1)
-            bin_lower = torch.cat([bins[..., :1], bin_centers], -1)
-            bins = bin_lower + (bin_upper - bin_lower) * t_rand
-        else:
-            bins = bins.repeat(num_rays, 1)
-
-        # s_near, s_far in [0, 1]
-        s_near, s_far = (self.spacing_fn(x) for x in (ray_bundle.nears, ray_bundle.fars))
-        spacing_to_euclidean_fn = lambda x: self.spacing_fn_inv(x * s_far + (1 - x) * s_near)
-        # euclidean = world
-        euclidean_bins = spacing_to_euclidean_fn(bins)  # [num_rays, num_samples+1]
-
-        return ray_bundle.get_ray_samples(
-            bin_starts=euclidean_bins[..., :-1, None],  # world [near, far]
-            bin_ends=euclidean_bins[..., 1:, None],     # world [near, far]
-            spacing_starts=bins[..., :-1, None],        # [0, 1]
-            spacing_ends=bins[..., 1:, None],           # [0, 1]
-            spacing_to_euclidean_fn=spacing_to_euclidean_fn,
-        )
+        return super().generate_ray_samples(ray_bundle, num_samples, sample_method="piecewise_linear")
 
 
-class UniformSampler(SpacedSampler):
+class LinearUniformSampler(LinearSpacedSampler):
     """Sample uniformly along a ray
+
     Args:
         num_samples: Number of samples per ray
-        train_stratified: Use stratified sampling during training. Defults to True
+        train_stratified: Use stratified sampling during training. Defaults to True
         single_jitter: Use a same random jitter for all samples along a ray. Defaults to False
     """
 
@@ -255,11 +91,12 @@ class UniformSampler(SpacedSampler):
         )
 
 
-class LinearDisparitySampler(SpacedSampler):
+class LinearLinearDisparitySampler(LinearSpacedSampler):
     """Sample linearly in disparity along a ray
+
     Args:
         num_samples: Number of samples per ray
-        train_stratified: Use stratified sampling during training. Defults to True
+        train_stratified: Use stratified sampling during training. Defaults to True
         single_jitter: Use a same random jitter for all samples along a ray. Defaults to False
     """
 
@@ -278,12 +115,63 @@ class LinearDisparitySampler(SpacedSampler):
         )
 
 
-class UniformLinDispPiecewiseSampler(SpacedSampler):
-    """Piecewise sampler along a ray that allocates the first half of the samples uniformly and the second half
-    using linearly in disparity spacing.
+class LinearSqrtSampler(LinearSpacedSampler):
+    """Square root sampler along a ray
+
     Args:
         num_samples: Number of samples per ray
-        train_stratified: Use stratified sampling during training. Defults to True
+        train_stratified: Use stratified sampling during training. Defaults to True
+    """
+
+    def __init__(
+        self,
+        num_samples: Optional[int] = None,
+        train_stratified=True,
+        single_jitter=False,
+    ) -> None:
+        super().__init__(
+            num_samples=num_samples,
+            spacing_fn=torch.sqrt,
+            spacing_fn_inv=lambda x: x**2,
+            train_stratified=train_stratified,
+            single_jitter=single_jitter,
+        )
+
+
+class LinearLogSampler(LinearSpacedSampler):
+    """Log sampler along a ray
+
+    Args:
+        num_samples: Number of samples per ray
+        train_stratified: Use stratified sampling during training. Defaults to True
+    """
+
+    def __init__(
+        self,
+        num_samples: Optional[int] = None,
+        train_stratified=True,
+        single_jitter=False,
+    ) -> None:
+        super().__init__(
+            num_samples=num_samples,
+            spacing_fn=torch.log,
+            spacing_fn_inv=torch.exp,
+            train_stratified=train_stratified,
+            single_jitter=single_jitter,
+        )
+
+
+
+
+
+class LinearUniformLinDispPiecewiseSampler(LinearSpacedSampler):
+    """Piecewise sampler along a ray that allocates the first half of the samples uniformly and the second half
+    using linearly in disparity spacing.
+
+
+    Args:
+        num_samples: Number of samples per ray
+        train_stratified: Use stratified sampling during training. Defaults to True
         single_jitter: Use a same random jitter for all samples along a ray. Defaults to False
     """
 
@@ -302,8 +190,73 @@ class UniformLinDispPiecewiseSampler(SpacedSampler):
         )
 
 
-class PDFSampler(Sampler):
+
+def pw_linear_sample_increasing(s_left, s_right, T_left, tau_left, tau_right, u, epsilon=1e-3):
+    ### Fix this, need negative sign
+    ln_term = -torch.log(torch.max(torch.ones_like(T_left)*epsilon, torch.div(1-u, torch.max(torch.ones_like(T_left)*epsilon,T_left) ) ))
+    discriminant = tau_left**2 + torch.div( 2 * (tau_right - tau_left) * ln_term , torch.max(torch.ones_like(s_right)*epsilon, s_right - s_left) )
+
+    t = torch.div( (s_right - s_left) * (-tau_left + torch.sqrt(torch.max(torch.ones_like(discriminant)*epsilon, discriminant))) , torch.max(torch.ones_like(tau_left)*epsilon, tau_right - tau_left))
+
+    ### clamp t to [0, s_right - s_left]
+    # print("t clamping")
+    # print(torch.max(t))
+    t = torch.clamp(t, torch.ones_like(t, device=t.device)*epsilon, s_right - s_left)
+    # print(torch.max(t))
+    # print()
+
+    sample = s_left + t
+
+    return sample
+
+def pw_linear_sample_decreasing(s_left, s_right, T_left, tau_left, tau_right, u, epsilon=1e-3):
+    ### Fix this, need negative sign
+    ln_term = -torch.log(torch.max(torch.ones_like(T_left)*epsilon, torch.div(1-u, torch.max(torch.ones_like(T_left)*epsilon,T_left) ) ))
+    discriminant = tau_left**2 - torch.div( 2 * (tau_left - tau_right) * ln_term , torch.max(torch.ones_like(s_right)*epsilon, s_right - s_left) )
+    t = torch.div( (s_right - s_left) * (tau_left - torch.sqrt(torch.max(torch.ones_like(discriminant)*epsilon, discriminant))) , torch.max(torch.ones_like(tau_left)*epsilon, tau_left - tau_right))
+
+    ### clamp t to [0, s_right - s_left]
+    # print("t clamping")
+    # print(torch.max(t))
+    t = torch.clamp(t, torch.ones_like(t, device=t.device)*epsilon, s_right - s_left)
+    # print(torch.max(t))
+    # print()
+
+    sample = s_left + t
+
+    return sample
+def pw_linear_sample_fn(cdf, existing_bins, u, densities, transmittance, epsilon=1e-3, zero_threshold=1e-4):
+    transmittance = torch.cat([transmittance, torch.zeros([transmittance.shape[0], 1, 1], device=densities.device)], dim=1)
+    inds = torch.searchsorted(cdf, u, side="right")
+    below = torch.clamp(inds - 1, 0, existing_bins.shape[-1] - 1)
+    above = torch.clamp(inds, 0, existing_bins.shape[-1] - 1)
+    bins_g0 = torch.gather(existing_bins, -1, below)
+    bins_g1 = torch.gather(existing_bins, -1, above)
+    densities_g0 = torch.gather(densities[..., 0], -1, below)
+    densities_g1 = torch.gather(densities[..., 0], -1, above)
+    transmittance_g0 = torch.gather(transmittance[..., 0], -1, below)
+    densities_diff = densities[:, 1:] - densities[:, :-1]
+    densities_diff_g0 = torch.gather(densities_diff[..., 0], -1, torch.clamp(below, 0, densities_diff.shape[-1] - 1))
+    
+    dummy = torch.ones_like(bins_g0) * -1.0
+
+    ### Constant interval, take the left bin
+    samples1 = torch.where(torch.logical_and(densities_diff_g0 < zero_threshold, densities_diff_g0 > -zero_threshold), bins_g0, dummy)
+
+    samples2 = torch.where(bins_g0 >= zero_threshold, pw_linear_sample_increasing(bins_g0, bins_g1, transmittance_g0, densities_g0, densities_g1, u, epsilon=epsilon), samples1)
+
+    samples3 = torch.where(bins_g0 <= -zero_threshold, pw_linear_sample_decreasing(bins_g0, bins_g1, transmittance_g0, densities_g0, densities_g1, u, epsilon=epsilon), samples2)
+
+
+    ## Check for nan --> need to figure out why
+    samples = torch.where(torch.isnan(samples3), bins_g0, samples3)
+
+
+    return samples
+
+class LinearPDFSampler(PDFSampler):
     """Sample based on probability distribution
+
     Args:
         num_samples: Number of samples per ray
         train_stratified: Randomize location within each bin during training.
@@ -319,34 +272,40 @@ class PDFSampler(Sampler):
         single_jitter: bool = False,
         include_original: bool = True,
         histogram_padding: float = 0.01,
+        add_end_bin: bool = False,
+        concat_walls: bool = True
     ) -> None:
-        super().__init__(num_samples=num_samples)
-        self.train_stratified = train_stratified
-        self.include_original = include_original
-        self.histogram_padding = histogram_padding
-        self.single_jitter = single_jitter
+        super().__init__(num_samples=num_samples, train_stratified=train_stratified, single_jitter=single_jitter, include_original=include_original, histogram_padding=histogram_padding, add_end_bin=False)
+        self.concat_walls=concat_walls
 
-    # noinspection PyMethodOverriding
+
+
     def generate_ray_samples(
         self,
-        ray_bundle: RayBundle,
+        ray_bundle: Optional[RayBundle] = None,
         ray_samples: Optional[RaySamples] = None,
-        weights: Optional[torch.Tensor] = None,
+        weights: Optional[Float[Tensor, "*batch num_samples 1"]] = None,
+        densities: Optional[Float[Tensor, "*batch num_samples 1"]] = None,
+        transmittance: Optional[Float[Tensor, "*batch num_samples 1"]] = None,
         num_samples: Optional[int] = None,
         eps: float = 1e-5,
     ) -> RaySamples:
         """Generates position samples given a distribution.
+
         Args:
-            ray_bundle: Ray-origins, directions, etc.
+            ray_bundle: Rays to generate samples for
             ray_samples: Existing ray samples
-            weights: Weights for each bin  [..., "num_samples", 1]
+            weights: Weights for each bin
             num_samples: Number of samples per ray
             eps: Small value to prevent numerical issues.
+
         Returns:
             Positions and deltas for samples along a ray
         """
+
         if ray_samples is None or ray_bundle is None:
-            raise ValueError("ray_samples must be provided")
+            raise ValueError("ray_samples and ray_bundle must be provided")
+        assert weights is not None, "weights must be provided"
 
         num_samples = num_samples or self.num_samples
         assert num_samples is not None
@@ -359,15 +318,13 @@ class PDFSampler(Sampler):
         padding = torch.relu(eps - weights_sum)
         weights = weights + padding / weights.shape[-1]
         weights_sum += padding
-
-        pdf = weights / weights_sum
+        pdf = weights / weights.sum(dim=-1, keepdim=True)
         cdf = torch.min(torch.ones_like(pdf), torch.cumsum(pdf, dim=-1))
-        cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], dim=-1)
-
+        cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], dim=-1) # N + 3 (N + 1)
         if self.train_stratified and self.training:
             # Stratified samples between 0 and 1
             u = torch.linspace(0.0, 1.0 - (1.0 / num_bins), steps=num_bins, device=cdf.device)
-            u = u.expand((*cdf.shape[:-1], num_bins))
+            u = u.expand(size=(*cdf.shape[:-1], num_bins))
             if self.single_jitter:
                 rand = torch.rand((*cdf.shape[:-1], 1), device=cdf.device) / num_bins
             else:
@@ -384,96 +341,89 @@ class PDFSampler(Sampler):
             ray_samples.spacing_starts is not None and ray_samples.spacing_ends is not None
         ), "ray_sample spacing_starts and spacing_ends must be provided"
         assert ray_samples.spacing_to_euclidean_fn is not None, "ray_samples.spacing_to_euclidean_fn must be provided"
-        existing_bins = torch.cat(
-            [
-                ray_samples.spacing_starts[..., 0],
-                ray_samples.spacing_ends[..., -1:, 0],
-            ],
-            dim=-1,
-        )  # [0, 1]
+        if self.concat_walls:
+            existing_bins = torch.cat(
+                [
+                    torch.zeros_like(ray_samples.spacing_starts[..., :1, 0]),
+                    ray_samples.spacing_starts[..., 0],
+                    ray_samples.spacing_ends[..., -1:, 0], 
+                    torch.ones_like(ray_samples.spacing_starts[..., :1, 0]), # N + 3
+                ],
+                dim=-1,
+            )
+        else:
+            existing_bins = torch.cat(
+                [
+                    ray_samples.spacing_starts[..., 0],
+                    ray_samples.spacing_ends[..., -1:, 0], 
+                ],
+                dim=-1,
+            )
+        
 
-        inds = torch.searchsorted(cdf, u, right=True)
-        below = torch.clamp(inds - 1, 0, existing_bins.shape[-1] - 1)
-        above = torch.clamp(inds, 0, existing_bins.shape[-1] - 1)
-        cdf_g0 = torch.gather(cdf, -1, below)
-        bins_g0 = torch.gather(existing_bins, -1, below)
-        cdf_g1 = torch.gather(cdf, -1, above)
-        bins_g1 = torch.gather(existing_bins, -1, above)
-
-        t = torch.clip(torch.nan_to_num((u - cdf_g0) / (cdf_g1 - cdf_g0), 0), 0, 1)
-        bins = bins_g0 + t * (bins_g1 - bins_g0)
+        bins = pw_linear_sample_fn(cdf, existing_bins, u, densities, transmittance) 
 
         if self.include_original:
-            bins, _ = torch.sort(torch.cat([existing_bins, bins], -1), -1)
+            bins, _ = torch.sort(torch.cat([existing_bins[..., 1:], bins], -1), -1)
 
         # Stop gradients
         bins = bins.detach()
 
         euclidean_bins = ray_samples.spacing_to_euclidean_fn(bins)
 
-        return ray_bundle.get_ray_samples(
+        ray_samples = ray_bundle.get_ray_samples(
             bin_starts=euclidean_bins[..., :-1, None],
             bin_ends=euclidean_bins[..., 1:, None],
             spacing_starts=bins[..., :-1, None],
             spacing_ends=bins[..., 1:, None],
             spacing_to_euclidean_fn=ray_samples.spacing_to_euclidean_fn,
+            sample_method="piecewise_linear"
         )
-
-
-class ProposalNetworkSampler(Sampler):
-    """Sampler that uses a proposal network to generate samples."""
+        return ray_samples
+    
+    
+class LinearProposalNetworkSampler(ProposalNetworkSampler):
     def __init__(
         self,
-        num_proposal_samples_per_ray: Tuple[int] = (64,),
+        num_proposal_samples_per_ray: Tuple[int, ...] = (64,),
         num_nerf_samples_per_ray: int = 32,
         num_proposal_network_iterations: int = 2,
         single_jitter: bool = False,
         update_sched: Callable = lambda x: 1,
         initial_sampler: Optional[Sampler] = None,
+        add_end_bin: bool = False
     ) -> None:
-        super().__init__()
-        self.num_proposal_samples_per_ray = num_proposal_samples_per_ray
-        self.num_nerf_samples_per_ray = num_nerf_samples_per_ray
-        self.num_proposal_network_iterations = num_proposal_network_iterations
-        self.update_sched = update_sched
-        if self.num_proposal_network_iterations < 1:
-            raise ValueError("num_proposal_network_iterations must be >= 1")
+        super().__init__(
+            num_proposal_samples_per_ray=num_proposal_samples_per_ray,
+            num_nerf_samples_per_ray=num_nerf_samples_per_ray,
+            num_proposal_network_iterations=num_proposal_network_iterations,
+            single_jitter=single_jitter,
+            update_sched=update_sched,
+            initial_sampler=initial_sampler,
+            add_end_bin=False)
 
         # samplers
         if initial_sampler is None:
-            initial_sampler = UniformLinDispPiecewiseSampler(single_jitter=single_jitter)
-        self.initial_sampler = initial_sampler
-        self.pdf_sampler = PDFSampler(include_original=False, single_jitter=single_jitter)
-
-        self._anneal = 1.0
-        self._steps_since_update = 0
-        self._step = 0
-
-    def set_anneal(self, anneal: float) -> None:
-        """Set the anneal value for the proposal network."""
-        self._anneal = anneal
-
-    def step_cb(self, step):
-        """Callback to register a training step has passed. This is used to keep track of the sampling schedule"""
-        self._step = step
-        self._steps_since_update += 1
+            self.initial_sampler = LinearUniformLinDispPiecewiseSampler(single_jitter=single_jitter)
+        else:
+            self.initial_sampler = initial_sampler
+        self.pdf_sampler = LinearPDFSampler(include_original=False, single_jitter=single_jitter, add_end_bin=add_end_bin)
 
     def generate_ray_samples(
         self,
         ray_bundle: Optional[RayBundle] = None,
-        timestamps: Optional[float] = None,
         density_fns: Optional[List[Callable]] = None,
+        **density_kwargs
     ) -> Tuple[RaySamples, List, List]:
         assert ray_bundle is not None
         assert density_fns is not None
-        assert len(density_fns) == self.num_proposal_network_iterations
 
         weights_list = []
         ray_samples_list = []
 
         n = self.num_proposal_network_iterations
         weights = None
-        ray_samples = None
+        ray_samples: Optional[RaySamples] = None
         updated = self._steps_since_update > self.update_sched(self._step) or self._step < 10
         for i_level in range(n + 1):
             is_prop = i_level < n
@@ -485,26 +435,20 @@ class ProposalNetworkSampler(Sampler):
                 # PDF sampling based on the last samples and their weights
                 # Perform annealing to the weights. This will be a no-op if self._anneal is 1.0.
                 assert weights is not None
-                annealed_weights = torch.pow(weights, self._anneal)
-                ray_samples = self.pdf_sampler(ray_bundle, ray_samples, annealed_weights, num_samples=num_samples)
+                ray_samples = self.pdf_sampler(ray_bundle, ray_samples, weights, densities, transmittance, num_samples=num_samples)
             if is_prop:
+                assert ray_samples is not None
                 if updated:
                     # always update on the first step or the inf check in grad scaling crashes
-                    density = density_fns[i_level](ray_samples.get_positions(), timestamps)  # world space
+                    density = density_fns[i_level](ray_samples.frustums.get_positions())
                 else:
                     with torch.no_grad():
-                        density = density_fns[i_level](ray_samples.get_positions(), timestamps)
-                weights = ray_samples.get_weights(density)
-                weights_list.append(weights)  # (num_rays, num_samples)
-                ray_samples_list.append(ray_samples)
+                        density = density_fns[i_level](ray_samples.frustums.get_positions())
+                weights, densities, transmittance = ray_samples.get_weights_linear(density)
+                weights_list.append(weights[:, 1:-1])  # (num_rays, num_samples)
+                ray_samples_list.append(ray_samples[:, :-1])
         if updated:
             self._steps_since_update = 0
 
         assert ray_samples is not None
         return ray_samples, weights_list, ray_samples_list
-
-    def __str__(self):
-        return (f"ProposalNetworkSampler("
-                f"num_proposal_samples_per_ray={self.num_proposal_samples_per_ray}, "
-                f"num_nerf_samples_per_ray={self.num_nerf_samples_per_ray}, "
-                f"num_proposal_network_iterations={self.num_proposal_network_iterations})")

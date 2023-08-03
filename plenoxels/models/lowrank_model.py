@@ -9,7 +9,9 @@ from plenoxels.models.kplane_field import KPlaneField
 from plenoxels.ops.activations import init_density_activation
 from plenoxels.raymarching.ray_samplers import (
     UniformLinDispPiecewiseSampler, UniformSampler,
-    ProposalNetworkSampler, RayBundle, RaySamples
+    # ProposalNetworkSampler, RayBundle, RaySamples
+    LinearProposalNetworkSampler, 
+    RayBundle, RaySamples
 )
 from plenoxels.raymarching.spatial_distortions import SceneContraction, SpatialDistortion
 from plenoxels.utils.timer import CudaTimer
@@ -120,7 +122,7 @@ class LowrankModel(nn.Module):
             initial_sampler = UniformLinDispPiecewiseSampler(single_jitter=single_jitter)
         else:
             initial_sampler = UniformSampler(single_jitter=single_jitter)
-        self.proposal_sampler = ProposalNetworkSampler(
+        self.proposal_sampler = LinearProposalNetworkSampler(
             num_nerf_samples_per_ray=num_samples,
             num_proposal_samples_per_ray=num_proposal_samples,
             num_proposal_network_iterations=self.num_proposal_iterations,
